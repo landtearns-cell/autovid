@@ -60,56 +60,40 @@ function generateScreenshots(videoPath, count, outputFolder) {
     });
 }
 
-function createSlideshow(images, audioPath, outputPath) {
+function createChunk(imagePath, outputPath, duration) {
     return new Promise((resolve, reject) => {
-        let command = ffmpeg();
-        
-        // Add images as looped inputs
-        images.forEach(img => {
-            command.input(img).inputOptions(['-loop 1', '-t 5', '-framerate 30']);
-        });
-        
-        // Add Audio
-        command.input(audioPath);
-
-        let filter = [];
-        
-        if (images.length > 1) {
-            // First transition between img 0 and 1
-            filter.push({
-                filter: 'xfade',
-                options: { transition: 'slideleft', duration: 1, offset: 4 },
-                inputs: ['0:v', '1:v'],
-                outputs: 'v1'
-            });
-
-            // Subsequent transitions
-            for (let i = 1; i < images.length - 1; i++) {
-                const offset = 4 + i * 4;
-                filter.push({
-                    filter: 'xfade',
-                    options: { transition: 'slideleft', duration: 1, offset: offset },
-                    inputs: [`v${i}`, `${i + 1}:v`],
-                    outputs: `v${i + 1}`
-                });
-            }
-            command.complexFilter(filter, `v${images.length - 1}`);
-            command.outputOptions(['-map', `[v${images.length - 1}]`]);
-        } else {
-            // Only 1 image, no complex filters needed
-            command.outputOptions(['-map', '0:v']);
-        }
-
-        command
+        ffmpeg()
+            .input(imagePath)
+            .inputOptions(['-loop 1', '-t ' + duration, '-framerate 30'])
             .outputOptions([
-                '-map', `${images.length}:a`, // Audio is added right after all N images
+                '-vf', `fade=t=in:st=0:d=0.5,fade=t=out:st=${duration - 0.5}:d=0.5`,
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-threads', '1',
                 '-pix_fmt', 'yuv420p',
+                '-s', '854x480' // Guarantee standard resolution
+            ])
+            .save(outputPath)
+            .on('end', () => resolve(outputPath))
+            .on('error', reject);
+    });
+}
+
+function concatChunksAndAudio(chunkFiles, audioPath, outputPath, workDir) {
+    return new Promise((resolve, reject) => {
+        const listFile = path.join(workDir, 'list.txt');
+        const fileContent = chunkFiles.map(f => `file '${f}'`).join('\n');
+        fs.writeFileSync(listFile, fileContent);
+
+        ffmpeg()
+            .input(listFile)
+            .inputOptions(['-f concat', '-safe 0'])
+            .input(audioPath)
+            .outputOptions([
+                '-c:v', 'copy', // Zero CPU copy, just stitches them together
                 '-c:a', 'aac',
                 '-b:a', '192k',
-                '-shortest' // This is the magic bullet: cuts final video to exactly the audio length!
+                '-shortest'
             ])
             .save(outputPath)
             .on('end', () => resolve(outputPath))
@@ -136,13 +120,8 @@ async function processJob(videoUrl, audioUrl, webhookUrl) {
         console.log(`[Job ${jobId}] Getting durations...`);
         const audioDur = await getDuration(audioPath);
         
-        // Calculate needed screenshot count
-        // 1st image gives 5 seconds. Each additional image adds 4 seconds (due to 1 sec overlap in transition).
-        // formula: total_len = 5 + (N-1)*4 = 4N + 1
-        // we want total_len >= audioDur
-        // 4N + 1 >= audioDur
-        // N >= (audioDur - 1) / 4
-        let numImages = Math.ceil((audioDur - 1) / 4);
+        // 5 seconds per chunk
+        let numImages = Math.ceil(audioDur / 5);
         if (numImages < 1) numImages = 1;
         
         console.log(`[Job ${jobId}] Audio duration is ${audioDur}s. Extracting ${numImages} screenshots...`);
@@ -152,8 +131,16 @@ async function processJob(videoUrl, audioUrl, webhookUrl) {
             throw new Error('Failed to extract any images from the video.');
         }
 
-        console.log(`[Job ${jobId}] Combining ${images.length} images into slideshow with 'slide left' transition...`);
-        await createSlideshow(images, audioPath, outputPath);
+        console.log(`[Job ${jobId}] Processing ${images.length} images into individual chunks...`);
+        const chunkFiles = [];
+        for (let i = 0; i < images.length; i++) {
+            const chunkOut = path.join(workDir, `chunk_${i}.mp4`);
+            await createChunk(images[i], chunkOut, 5);
+            chunkFiles.push(chunkOut);
+        }
+
+        console.log(`[Job ${jobId}] Combining chunks and audio instantly...`);
+        await concatChunksAndAudio(chunkFiles, audioPath, outputPath, workDir);
 
         console.log(`[Job ${jobId}] Sending to webhook...`);
         await sendResultToWebhook(outputPath, webhookUrl);
@@ -164,7 +151,6 @@ async function processJob(videoUrl, audioUrl, webhookUrl) {
         console.error(`[Job ${jobId}] Failed with error:`, error);
         throw error;
     } finally {
-        // Cleanup the temporary files
         console.log(`[Job ${jobId}] Cleaning up temp files...`);
         fs.rmSync(workDir, { recursive: true, force: true });
     }
