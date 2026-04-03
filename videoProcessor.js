@@ -41,7 +41,8 @@ function generateScreenshots(videoPath, count, outputFolder) {
             .screenshots({
                 count: count,
                 folder: outputFolder,
-                filename: 'screenshot_%i.png'
+                filename: 'screenshot_%i.png',
+                size: '854x480'
             })
             .on('end', () => {
                 // Ensure the files actually exist and return paths
@@ -72,25 +73,13 @@ function createSlideshow(images, audioPath, outputPath) {
         command.input(audioPath);
 
         let filter = [];
-        let outputLabel = '';
         
-        // We will scale images to 1080p to normalize everything before transition
-        // This prevents xfade crash if dimensions differ.
-        images.forEach((_, idx) => {
-            filter.push({
-                filter: 'scale',
-                options: '1920:1080',
-                inputs: `${idx}:v`,
-                outputs: `scaled_${idx}`
-            });
-        });
-
         if (images.length > 1) {
             // First transition between img 0 and 1
             filter.push({
                 filter: 'xfade',
                 options: { transition: 'slideleft', duration: 1, offset: 4 },
-                inputs: ['scaled_0', 'scaled_1'],
+                inputs: ['0:v', '1:v'],
                 outputs: 'v1'
             });
 
@@ -100,22 +89,23 @@ function createSlideshow(images, audioPath, outputPath) {
                 filter.push({
                     filter: 'xfade',
                     options: { transition: 'slideleft', duration: 1, offset: offset },
-                    inputs: [`v${i}`, `scaled_${i + 1}`],
+                    inputs: [`v${i}`, `${i + 1}:v`],
                     outputs: `v${i + 1}`
                 });
             }
-            outputLabel = `v${images.length - 1}`;
+            command.complexFilter(filter, `v${images.length - 1}`);
+            command.outputOptions(['-map', `[v${images.length - 1}]`]);
         } else {
-            outputLabel = 'scaled_0';
+            // Only 1 image, no complex filters needed
+            command.outputOptions(['-map', '0:v']);
         }
 
         command
-            .complexFilter(filter, outputLabel)
             .outputOptions([
-                '-map', `[${outputLabel}]`,
                 '-map', `${images.length}:a`, // Audio is added right after all N images
                 '-c:v', 'libx264',
-                '-preset', 'fast',
+                '-preset', 'ultrafast',
+                '-threads', '1',
                 '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac',
                 '-b:a', '192k',
